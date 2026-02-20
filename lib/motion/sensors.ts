@@ -42,9 +42,9 @@ export async function requestAllPermissions(): Promise<{
 
 // --- Bow velocity processor ---
 
-const DAMPING = 0.91;
-const DEAD_ZONE = 0.06;
-const MAX_VEL = 10;
+const DAMPING = 0.96;
+const DEAD_ZONE = 0.03;
+const MAX_VEL = 3;
 const MIN_ONSET_GAP_MS = 120;
 
 class BowProcessor {

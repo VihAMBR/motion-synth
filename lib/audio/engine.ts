@@ -137,7 +137,7 @@ export class ViolinEngine {
     // --- Filter ---
     this.filter = this.ctx.createBiquadFilter();
     this.filter.type = "lowpass";
-    this.filter.frequency.setValueAtTime(400, t);
+    this.filter.frequency.setValueAtTime(800, t);
     this.filter.Q.setValueAtTime(1.2, t);
 
     // --- Mix bus ---
@@ -306,9 +306,11 @@ export class ViolinEngine {
     if (!this.ctx || !this.bodyGain || !this.noiseGain) return;
     const t = this.ctx.currentTime;
 
-    if (this.gateOpen && this.bowEnergy > 0) {
-      const bodyLevel = this.bowEnergy * 0.35;
-      const noiseLevel = Math.pow(this.bowEnergy, 2) * 0.18;
+    if (this.gateOpen) {
+      // Curve the energy so low-bow is still clearly audible
+      const curved = Math.pow(this.bowEnergy, 0.6);
+      const bodyLevel = 0.05 + curved * 0.55;
+      const noiseLevel = curved * curved * 0.25;
       this.bodyGain.gain.setTargetAtTime(bodyLevel, t, T_FAST);
       this.noiseGain.gain.setTargetAtTime(noiseLevel, t, T_FAST);
     } else {
@@ -321,8 +323,8 @@ export class ViolinEngine {
     if (!this.ctx || !this.filter) return;
     const t = this.ctx.currentTime;
 
-    const BASE = 300;
-    const RANGE = 4500;
+    const BASE = 600;
+    const RANGE = 5000;
     const dirBias = this.bowDir > 0 ? 1.12 : 0.9;
     const cutoff =
       (BASE + (this.bowEnergy * 0.55 + this.brightness * 0.45) * RANGE) * dirBias;

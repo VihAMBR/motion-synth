@@ -2,265 +2,337 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  AudioEngine,
-  AxisMappings,
-  DEFAULT_MAPPINGS,
-  BETA_TARGETS,
-  GAMMA_TARGETS,
-  ALPHA_TARGETS,
-  TARGET_LABELS,
-  ControlTarget,
+  ViolinEngine,
+  SCALE_MIDI,
+  MIDI_LOW,
+  MIDI_HIGH,
+  midiToNoteName,
+  yNormToMidi,
+  midiToYNorm,
 } from "../lib/audio/engine";
 import {
-  requestMotionPermission,
-  listenMotion,
-  MotionValues,
+  requestAllPermissions,
+  listenSensors,
+  captureCalibration,
+  Calibration,
+  SensorState,
 } from "../lib/motion/sensors";
 
-const NOTE_NAMES = ["C", "D", "E", "F", "G", "A", "B", "C"];
-const MIDI_NOTES = [60, 62, 64, 65, 67, 69, 71, 72];
-const PAD_COLORS = [
-  "#ff6b6b",
-  "#ffa94d",
-  "#ffd43b",
-  "#69db7c",
-  "#38d9a9",
-  "#4dabf7",
-  "#748ffc",
-  "#da77f2",
-];
-
-function nextTarget(current: ControlTarget, list: ControlTarget[]) {
-  const idx = list.indexOf(current);
-  return list[(idx + 1) % list.length];
-}
-
 export default function Home() {
-  const engineRef = useRef<AudioEngine | null>(null);
-  const cleanupMotionRef = useRef<(() => void) | null>(null);
+  const engineRef = useRef<ViolinEngine | null>(null);
+  const cleanupRef = useRef<(() => void) | null>(null);
+  const fingerboardRef = useRef<HTMLDivElement>(null);
+  const touchIndicatorRef = useRef<HTMLDivElement>(null);
+  const touchActiveRef = useRef(false);
+  const calibrationRef = useRef<Calibration | null>(null);
 
-  const [started, setStarted] = useState(false);
+  const [phase, setPhase] = useState<"start" | "playing">("start");
   const [motionStatus, setMotionStatus] = useState("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [motion, setMotion] = useState<MotionValues>({ alpha: 0, beta: 0, gamma: 0 });
-  const [activePads, setActivePads] = useState<Set<number>>(new Set());
-  const [mappings, setMappings] = useState<AxisMappings>({ ...DEFAULT_MAPPINGS });
+  const [quantized, setQuantized] = useState(true);
+  const [invertBow, setInvertBow] = useState(false);
+  const [currentNote, setCurrentNote] = useState<string | null>(null);
+  const [bowState, setBowState] = useState({ energy: 0, direction: 1 });
+  const [tiltState, setTiltState] = useState({ beta: 0, gamma: 0 });
 
   useEffect(() => {
-    engineRef.current = new AudioEngine();
+    engineRef.current = new ViolinEngine();
     return () => {
       engineRef.current?.allOff();
-      cleanupMotionRef.current?.();
+      cleanupRef.current?.();
     };
   }, []);
 
-  const isSecureContext =
+  const isSecure =
     typeof window !== "undefined" &&
-    (window.isSecureContext || location.protocol === "https:" || location.hostname === "localhost");
+    (window.isSecureContext ||
+      location.protocol === "https:" ||
+      location.hostname === "localhost");
 
+  // --- Start ---
   const handleStart = useCallback(async () => {
     const engine = engineRef.current;
     if (!engine || engine.isStarted()) return;
     setErrorMsg(null);
 
-    setMotionStatus("requesting permission...");
-    const permResult = await requestMotionPermission();
+    // Permissions first (must be in gesture call stack)
+    setMotionStatus("requesting...");
+    const perms = await requestAllPermissions();
 
     try {
       await engine.start();
-      setStarted(true);
     } catch (e) {
       setErrorMsg(`Audio failed: ${e instanceof Error ? e.message : e}`);
-      setMotionStatus("error");
       return;
     }
 
-    switch (permResult) {
-      case "granted":
-      case "not-needed": {
-        const cleanup = listenMotion((values) => {
-          engine.setMotion(values.alpha, values.beta, values.gamma);
-          setMotion(values);
-        });
-        cleanupMotionRef.current = cleanup;
-        setMotionStatus("active");
-        break;
-      }
-      case "denied":
-        setMotionStatus("denied");
-        setErrorMsg(
-          "Motion permission denied. On iOS: Settings → Safari → Motion & Orientation Access must be ON. Then reload and tap Start again."
-        );
-        break;
-      case "no-sensor":
-        setMotionStatus("unavailable");
-        setErrorMsg("No motion sensor detected on this device.");
-        break;
+    setPhase("playing");
+
+    if (perms.motion && perms.orientation) {
+      startSensorLoop(engine);
+    } else if (perms.orientation) {
+      setMotionStatus("orientation only (no bow)");
+      startSensorLoop(engine);
+    } else {
+      setMotionStatus("denied");
+      setErrorMsg(
+        "Motion permission denied. On iOS: Settings → Safari → Motion & Orientation Access → ON, then reload."
+      );
     }
   }, []);
 
-  const updateMapping = useCallback(
-    (axis: keyof AxisMappings, list: ControlTarget[]) => {
-      setMappings((prev) => {
-        const next = { ...prev, [axis]: nextTarget(prev[axis], list) };
-        engineRef.current?.setMappings(next);
-        return next;
-      });
+  const startSensorLoop = useCallback(
+    (engine: ViolinEngine) => {
+      cleanupRef.current?.();
+      const cleanup = listenSensors(
+        (s: SensorState) => {
+          engine.setBow(s.bowEnergy, s.bowDirection);
+          engine.setBrightness((s.beta + 1) * 0.5);
+          engine.setVibratoDepth(s.gamma);
+          if (s.bowOnset) engine.triggerOnset();
+          setBowState({ energy: s.bowEnergy, direction: s.bowDirection });
+          setTiltState({ beta: s.beta, gamma: s.gamma });
+        },
+        calibrationRef.current,
+        invertBow,
+      );
+      cleanupRef.current = cleanup;
+      setMotionStatus("active");
     },
-    []
+    [invertBow],
   );
 
-  const padDown = useCallback((midi: number) => {
-    engineRef.current?.noteOn(midi);
-    setActivePads((prev) => new Set(prev).add(midi));
-  }, []);
+  // --- Calibrate ---
+  const handleCalibrate = useCallback(async () => {
+    const cal = await captureCalibration();
+    calibrationRef.current = cal;
+    const engine = engineRef.current;
+    if (engine?.isStarted()) startSensorLoop(engine);
+  }, [startSensorLoop]);
 
-  const padUp = useCallback((midi: number) => {
-    engineRef.current?.noteOff(midi);
-    setActivePads((prev) => {
-      const next = new Set(prev);
-      next.delete(midi);
+  // --- Invert bow ---
+  const toggleInvertBow = useCallback(() => {
+    setInvertBow((prev) => {
+      const next = !prev;
+      const engine = engineRef.current;
+      if (engine?.isStarted()) {
+        cleanupRef.current?.();
+        const cleanup = listenSensors(
+          (s: SensorState) => {
+            engine.setBow(s.bowEnergy, s.bowDirection);
+            engine.setBrightness((s.beta + 1) * 0.5);
+            engine.setVibratoDepth(s.gamma);
+            if (s.bowOnset) engine.triggerOnset();
+            setBowState({ energy: s.bowEnergy, direction: s.bowDirection });
+            setTiltState({ beta: s.beta, gamma: s.gamma });
+          },
+          calibrationRef.current,
+          next,
+        );
+        cleanupRef.current = cleanup;
+      }
       return next;
     });
   }, []);
 
-  return (
-    <div className="synth-container">
-      {!started ? (
-        <div className="start-screen">
-          {!isSecureContext && (
-            <div className="warning">
-              Not on HTTPS — motion sensors will not work.
-              <br />
-              Deploy to Vercel or use an ngrok/cloudflared tunnel.
-            </div>
-          )}
-          <button className="start-btn" onClick={handleStart}>
-            Tap to Start
-          </button>
-          {errorMsg && <div className="error-msg">{errorMsg}</div>}
-        </div>
-      ) : (
-        <>
-          <div className="header">
-            <h1>Motion Synth</h1>
-            <div className="status">
-              <span
-                className={`dot ${
-                  motionStatus === "active"
-                    ? "green"
-                    : motionStatus === "denied" || motionStatus === "error"
-                      ? "red"
-                      : "yellow"
-                }`}
-              />
-              <span>Motion: {motionStatus}</span>
-            </div>
-          </div>
+  // --- Fingerboard pointer handling ---
 
-          {errorMsg && <div className="error-banner">{errorMsg}</div>}
+  const quantizedRef = useRef(quantized);
+  quantizedRef.current = quantized;
 
-          <div className="pad-grid">
-            {MIDI_NOTES.map((midi, i) => (
-              <button
-                key={midi}
-                className={`pad ${activePads.has(midi) ? "active" : ""}`}
-                style={
-                  {
-                    "--pad-color": PAD_COLORS[i],
-                    "--pad-glow": PAD_COLORS[i] + "88",
-                  } as React.CSSProperties
-                }
-                onPointerDown={(e) => {
-                  e.preventDefault();
-                  padDown(midi);
-                }}
-                onPointerUp={() => padUp(midi)}
-                onPointerLeave={() => padUp(midi)}
-                onPointerCancel={() => padUp(midi)}
-              >
-                <span className="pad-note">{NOTE_NAMES[i]}</span>
-                <span className="pad-octave">{midi < 72 ? "4" : "5"}</span>
-              </button>
-            ))}
-          </div>
+  const getYNorm = useCallback((clientY: number) => {
+    const rect = fingerboardRef.current?.getBoundingClientRect();
+    if (!rect) return 0.5;
+    return Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+  }, []);
 
-          <div className="controls-panel">
-            <AxisRow
-              label="↕ Fwd/Back"
-              axis="beta"
-              value={motion.beta}
-              target={mappings.beta}
-              targets={BETA_TARGETS}
-              color="#f472b6"
-              onCycle={() => updateMapping("beta", BETA_TARGETS)}
-            />
-            <AxisRow
-              label="↔ Left/Right"
-              axis="gamma"
-              value={motion.gamma}
-              target={mappings.gamma}
-              targets={GAMMA_TARGETS}
-              color="#a78bfa"
-              onCycle={() => updateMapping("gamma", GAMMA_TARGETS)}
-            />
-            <AxisRow
-              label="↻ Twist"
-              axis="alpha"
-              value={motion.alpha}
-              target={mappings.alpha}
-              targets={ALPHA_TARGETS}
-              color="#38bdf8"
-              onCycle={() => updateMapping("alpha", ALPHA_TARGETS)}
-            />
-          </div>
-        </>
-      )}
-    </div>
+  const handleFingerDown = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      touchActiveRef.current = true;
+
+      const yNorm = getYNorm(e.clientY);
+      const midi = yNormToMidi(yNorm, quantizedRef.current);
+      engineRef.current?.setPitch(midi);
+      engineRef.current?.setGate(true);
+      setCurrentNote(midiToNoteName(midi));
+
+      if (touchIndicatorRef.current) {
+        const displayY = quantizedRef.current
+          ? midiToYNorm(midi) * 100
+          : yNorm * 100;
+        touchIndicatorRef.current.style.top = `${displayY}%`;
+        touchIndicatorRef.current.style.opacity = "1";
+      }
+    },
+    [getYNorm],
   );
-}
 
-function AxisRow({
-  label,
-  value,
-  target,
-  color,
-  onCycle,
-}: {
-  label: string;
-  axis: string;
-  value: number;
-  target: ControlTarget;
-  targets: ControlTarget[];
-  color: string;
-  onCycle: () => void;
-}) {
-  const pct = Math.abs(value) * 50;
-  const isNeg = value < 0;
+  const handleFingerMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (!touchActiveRef.current) return;
+      const yNorm = getYNorm(e.clientY);
+      const midi = yNormToMidi(yNorm, quantizedRef.current);
+      engineRef.current?.setPitch(midi);
+      setCurrentNote(midiToNoteName(midi));
+
+      if (touchIndicatorRef.current) {
+        const displayY = quantizedRef.current
+          ? midiToYNorm(midi) * 100
+          : yNorm * 100;
+        touchIndicatorRef.current.style.top = `${displayY}%`;
+      }
+    },
+    [getYNorm],
+  );
+
+  const handleFingerUp = useCallback(() => {
+    touchActiveRef.current = false;
+    engineRef.current?.setGate(false);
+    setCurrentNote(null);
+    if (touchIndicatorRef.current) {
+      touchIndicatorRef.current.style.opacity = "0";
+    }
+  }, []);
+
+  // --- Render ---
+
+  if (phase === "start") {
+    return (
+      <div className="container start-screen">
+        <h1 className="title">Motion Violin</h1>
+        <p className="subtitle">
+          Touch the string. Bow with your phone.
+        </p>
+        {!isSecure && (
+          <div className="warning">
+            Not on HTTPS — motion sensors will not work.
+            <br />
+            Deploy to Vercel or use ngrok.
+          </div>
+        )}
+        <button className="start-btn" onClick={handleStart}>
+          Tap to Start
+        </button>
+        {errorMsg && <div className="error-msg">{errorMsg}</div>}
+      </div>
+    );
+  }
+
+  const bowPct = (bowState.energy * 100).toFixed(0);
+  const bowArrow = bowState.direction > 0 ? "→" : "←";
 
   return (
-    <div className="axis-row">
-      <span className="axis-label">{label}</span>
-      <div className="axis-bar-track">
-        <div
-          className="axis-bar-fill"
-          style={{
-            width: `${pct.toFixed(1)}%`,
-            left: isNeg ? undefined : "50%",
-            right: isNeg ? "50%" : undefined,
-            background: color,
-          }}
-        />
-        <div className="axis-bar-center" />
+    <div className="container playing">
+      {/* --- Top bar --- */}
+      <div className="top-bar">
+        <div className="note-display">
+          <span className="note-name">{currentNote ?? "—"}</span>
+          <span className="bow-dir">{bowArrow}</span>
+        </div>
+        <div className="status-row">
+          <span
+            className={`dot ${
+              motionStatus === "active"
+                ? "green"
+                : motionStatus === "denied"
+                  ? "red"
+                  : "yellow"
+            }`}
+          />
+          <span className="status-text">{motionStatus}</span>
+        </div>
       </div>
-      <span className="axis-val">{value.toFixed(2)}</span>
-      <button
-        className="axis-target-btn"
-        style={{ borderColor: color, color }}
-        onClick={onCycle}
+
+      {errorMsg && <div className="error-banner">{errorMsg}</div>}
+
+      {/* --- Bow energy bar --- */}
+      <div className="bow-bar-container">
+        <div
+          className="bow-bar-fill"
+          style={{ width: `${bowPct}%` }}
+        />
+        <span className="bow-bar-label">Bow {bowPct}%</span>
+      </div>
+
+      {/* --- Fingerboard --- */}
+      <div
+        ref={fingerboardRef}
+        className="fingerboard"
+        onPointerDown={handleFingerDown}
+        onPointerMove={handleFingerMove}
+        onPointerUp={handleFingerUp}
+        onPointerCancel={handleFingerUp}
       >
-        {TARGET_LABELS[target]}
-      </button>
+        {/* Scale markers */}
+        {quantized &&
+          SCALE_MIDI.map((midi) => {
+            const y = midiToYNorm(midi) * 100;
+            return (
+              <div
+                key={midi}
+                className="scale-marker"
+                style={{ top: `${y}%` }}
+              >
+                <span className="marker-label">
+                  {midiToNoteName(midi)}
+                </span>
+                <div className="marker-line" />
+              </div>
+            );
+          })}
+
+        {/* Touch indicator */}
+        <div ref={touchIndicatorRef} className="touch-indicator" />
+      </div>
+
+      {/* --- Tilt readouts --- */}
+      <div className="tilt-row">
+        <div className="tilt-item">
+          <span className="tilt-label">↕ Brightness</span>
+          <div className="tilt-mini-bar">
+            <div
+              className="tilt-mini-fill bright"
+              style={{ width: `${((tiltState.beta + 1) * 50).toFixed(0)}%` }}
+            />
+          </div>
+        </div>
+        <div className="tilt-item">
+          <span className="tilt-label">↔ Vibrato</span>
+          <div className="tilt-mini-bar">
+            <div
+              className="tilt-mini-fill vib"
+              style={{ width: `${(Math.abs(tiltState.gamma) * 100).toFixed(0)}%` }}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* --- Bottom controls --- */}
+      <div className="bottom-bar">
+        <button
+          className={`ctrl-btn ${quantized ? "active" : ""}`}
+          onClick={() => setQuantized((q) => !q)}
+        >
+          {quantized ? "Quantized" : "Continuous"}
+        </button>
+        <button className="ctrl-btn" onClick={handleCalibrate}>
+          Calibrate
+        </button>
+        <button
+          className={`ctrl-btn ${invertBow ? "active" : ""}`}
+          onClick={toggleInvertBow}
+        >
+          Invert Bow
+        </button>
+        <button
+          className="ctrl-btn danger"
+          onClick={() => engineRef.current?.allOff()}
+        >
+          All Off
+        </button>
+      </div>
     </div>
   );
 }

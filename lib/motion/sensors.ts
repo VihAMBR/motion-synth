@@ -1,90 +1,181 @@
-export type MotionValues = {
-  alpha: number; // twist / compass — normalized to -1..1
-  beta: number;  // forward-back tilt — normalized to -1..1
-  gamma: number; // left-right tilt — normalized to -1..1
+export type Calibration = {
+  betaOffset: number;
+  gammaOffset: number;
 };
 
-export type MotionHandler = (values: MotionValues) => void;
+export type SensorState = {
+  bowEnergy: number;     // 0..1
+  bowDirection: number;  // 1 (down-bow/forward) or -1 (up-bow/back)
+  bowOnset: boolean;     // true the frame direction reverses with energy
+  beta: number;          // calibrated forward/back tilt, -1..1
+  gamma: number;         // calibrated left/right tilt, -1..1
+};
 
-function clamp(v: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, v));
+export type SensorCallback = (state: SensorState) => void;
+
+function clamp(v: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, v));
 }
 
-/**
- * Must be called synchronously inside a user-gesture handler (tap/click)
- * BEFORE any awaits, otherwise iOS will silently block the permission dialog.
- */
-export async function requestMotionPermission(): Promise<
-  "granted" | "denied" | "not-needed" | "no-sensor"
-> {
-  if (typeof window === "undefined") return "no-sensor";
+// --- iOS permission helpers ---
 
-  const DOE = DeviceOrientationEvent as unknown as {
-    requestPermission?: () => Promise<string>;
-  };
-
-  if (typeof DOE.requestPermission === "function") {
+async function requestPermission(EventType: unknown): Promise<boolean> {
+  const E = EventType as { requestPermission?: () => Promise<string> };
+  if (typeof E?.requestPermission === "function") {
     try {
-      const result = await DOE.requestPermission();
-      return result === "granted" ? "granted" : "denied";
+      return (await E.requestPermission()) === "granted";
     } catch {
-      return "denied";
+      return false;
     }
   }
-
-  if ("DeviceOrientationEvent" in window) {
-    return "not-needed";
-  }
-
-  return "no-sensor";
+  return true; // no permission needed (Android / desktop)
 }
 
-export function listenMotion(onMotion: MotionHandler): () => void {
-  let smoothAlpha = 0;
+export async function requestAllPermissions(): Promise<{
+  motion: boolean;
+  orientation: boolean;
+}> {
+  const motion = await requestPermission(DeviceMotionEvent);
+  const orientation = await requestPermission(DeviceOrientationEvent);
+  return { motion, orientation };
+}
+
+// --- Bow velocity processor ---
+
+const DAMPING = 0.91;
+const DEAD_ZONE = 0.06;
+const MAX_VEL = 10;
+const MIN_ONSET_GAP_MS = 120;
+
+class BowProcessor {
+  private velocity = 0;
+  private direction = 1;
+  private lastOnsetTime = 0;
+  private lastTime = 0;
+  invertAxis = false;
+
+  reset() {
+    this.velocity = 0;
+  }
+
+  /** Feed raw acceleration along bow axis. Returns bow state. */
+  update(accel: number): { energy: number; direction: number; onset: boolean } {
+    const now = performance.now();
+    const dt = this.lastTime ? Math.min((now - this.lastTime) / 1000, 0.05) : 0.016;
+    this.lastTime = now;
+
+    const a = this.invertAxis ? -accel : accel;
+
+    this.velocity += a * dt;
+    this.velocity *= Math.pow(DAMPING, dt * 60); // frame-rate independent
+    this.velocity = clamp(this.velocity, -MAX_VEL, MAX_VEL);
+
+    const absV = Math.abs(this.velocity);
+    let energy = absV / MAX_VEL;
+    energy = energy < DEAD_ZONE ? 0 : (energy - DEAD_ZONE) / (1 - DEAD_ZONE);
+    energy = Math.min(1, energy);
+
+    let onset = false;
+    const newDir = this.velocity >= 0 ? 1 : -1;
+    if (newDir !== this.direction && energy > 0.12) {
+      if (now - this.lastOnsetTime > MIN_ONSET_GAP_MS) {
+        onset = true;
+        this.lastOnsetTime = now;
+      }
+      this.direction = newDir;
+    }
+
+    return { energy, direction: this.direction, onset };
+  }
+}
+
+// --- Combined sensor listener ---
+
+export function listenSensors(
+  callback: SensorCallback,
+  calibration: Calibration | null,
+  invertBow: boolean,
+): () => void {
+  const bow = new BowProcessor();
+  bow.invertAxis = invertBow;
+
+  let latestBeta = 0;
+  let latestGamma = 0;
   let smoothBeta = 0;
   let smoothGamma = 0;
-  const k = 0.25; // smoothing factor
+  const k = 0.2;
 
-  // Alpha (compass heading 0..360) needs special handling:
-  // we track it as a delta from a baseline to get -1..1
-  let alphaBaseline: number | null = null;
+  const bOff = calibration?.betaOffset ?? 0;
+  const gOff = calibration?.gammaOffset ?? 0;
 
-  let last = 0;
-  const handler = (e: DeviceOrientationEvent) => {
-    const now = performance.now();
-    if (now - last < 16) return;
-    last = now;
+  // --- Orientation listener ---
+  const onOrientation = (e: DeviceOrientationEvent) => {
+    latestBeta = (e.beta ?? 0) - bOff;
+    latestGamma = (e.gamma ?? 0) - gOff;
+  };
+  window.addEventListener("deviceorientation", onOrientation, true);
 
-    // Beta: -180..180, most useful range ≈ -45..45
-    const rawBeta = clamp((e.beta ?? 0) / 45, -1, 1);
-    // Gamma: -90..90, most useful range ≈ -45..45
-    const rawGamma = clamp((e.gamma ?? 0) / 45, -1, 1);
+  // --- Motion listener (acceleration for bow) ---
+  let lastMotionTime = performance.now();
 
-    // Alpha: 0..360 compass heading → normalize as offset from initial position
-    let rawAlpha = 0;
-    if (e.alpha !== null) {
-      if (alphaBaseline === null) alphaBaseline = e.alpha;
-      let delta = e.alpha - alphaBaseline;
-      // Wrap to -180..180
-      if (delta > 180) delta -= 360;
-      if (delta < -180) delta += 360;
-      rawAlpha = clamp(delta / 45, -1, 1);
-    }
+  const onMotion = (e: DeviceMotionEvent) => {
+    lastMotionTime = performance.now();
 
-    smoothAlpha += k * (rawAlpha - smoothAlpha);
-    smoothBeta += k * (rawBeta - smoothBeta);
-    smoothGamma += k * (rawGamma - smoothGamma);
+    // Use pure acceleration if available, else accelerationIncludingGravity
+    const acc = e.acceleration?.z ?? e.accelerationIncludingGravity?.z ?? 0;
+    const bowState = bow.update(acc);
 
-    onMotion({
-      alpha: smoothAlpha,
+    // Smooth tilt values
+    smoothBeta += k * (clamp(latestBeta / 45, -1, 1) - smoothBeta);
+    smoothGamma += k * (clamp(latestGamma / 45, -1, 1) - smoothGamma);
+
+    callback({
+      bowEnergy: bowState.energy,
+      bowDirection: bowState.direction,
+      bowOnset: bowState.onset,
       beta: smoothBeta,
       gamma: smoothGamma,
     });
   };
+  window.addEventListener("devicemotion", onMotion, true);
 
-  window.addEventListener("deviceorientation", handler, true);
+  // --- Safety watchdog: decay bow if no motion events for 400ms ---
+  const watchdog = setInterval(() => {
+    if (performance.now() - lastMotionTime > 400) {
+      bow.reset();
+      callback({
+        bowEnergy: 0,
+        bowDirection: 1,
+        bowOnset: false,
+        beta: smoothBeta,
+        gamma: smoothGamma,
+      });
+    }
+  }, 200);
 
   return () => {
-    window.removeEventListener("deviceorientation", handler, true);
+    window.removeEventListener("deviceorientation", onOrientation, true);
+    window.removeEventListener("devicemotion", onMotion, true);
+    clearInterval(watchdog);
   };
+}
+
+/** Snapshot current orientation for calibration offsets. */
+export function captureCalibration(): Promise<Calibration> {
+  return new Promise((resolve) => {
+    const handler = (e: DeviceOrientationEvent) => {
+      window.removeEventListener("deviceorientation", handler, true);
+      resolve({
+        betaOffset: e.beta ?? 0,
+        gammaOffset: e.gamma ?? 0,
+      });
+    };
+    window.addEventListener("deviceorientation", handler, true);
+
+    // Fallback if no event within 500ms
+    setTimeout(() => {
+      window.removeEventListener("deviceorientation", handler, true);
+      resolve({ betaOffset: 0, gammaOffset: 0 });
+    }, 500);
+  });
 }

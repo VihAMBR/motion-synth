@@ -1,370 +1,334 @@
-export type ControlTarget =
-  | "filter-cutoff"
-  | "volume"
-  | "wave-blend"
-  | "vibrato-depth"
-  | "resonance"
-  | "reverb"
-  | "distortion"
-  | "pan"
-  | "delay-feedback"
-  | "pitch-bend";
+// E minor pentatonic, 2 octaves
+export const SCALE_MIDI = [52, 55, 57, 59, 62, 64, 67, 69, 71, 74, 76];
+export const MIDI_LOW = 52;
+export const MIDI_HIGH = 76;
 
-export type AxisMappings = {
-  beta: ControlTarget;
-  gamma: ControlTarget;
-  alpha: ControlTarget;
-};
+const CHROMATIC = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 
-export const DEFAULT_MAPPINGS: AxisMappings = {
-  beta: "filter-cutoff",
-  gamma: "vibrato-depth",
-  alpha: "pan",
-};
+export function midiToNoteName(midi: number): string {
+  const r = Math.round(midi);
+  return CHROMATIC[((r % 12) + 12) % 12] + (Math.floor(r / 12) - 1);
+}
 
-export const BETA_TARGETS: ControlTarget[] = [
-  "filter-cutoff",
-  "wave-blend",
-  "volume",
-];
+export function yNormToMidi(yNorm: number, quantized: boolean): number {
+  const cont = MIDI_HIGH - yNorm * (MIDI_HIGH - MIDI_LOW);
+  if (!quantized) return cont;
+  let best = SCALE_MIDI[0];
+  let bestD = Infinity;
+  for (const n of SCALE_MIDI) {
+    const d = Math.abs(cont - n);
+    if (d < bestD) { bestD = d; best = n; }
+  }
+  return best;
+}
 
-export const GAMMA_TARGETS: ControlTarget[] = [
-  "vibrato-depth",
-  "resonance",
-  "reverb",
-  "distortion",
-];
+export function midiToYNorm(midi: number): number {
+  return (MIDI_HIGH - midi) / (MIDI_HIGH - MIDI_LOW);
+}
 
-export const ALPHA_TARGETS: ControlTarget[] = [
-  "pan",
-  "delay-feedback",
-  "pitch-bend",
-];
+function midiToHz(midi: number) {
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
 
-export const TARGET_LABELS: Record<ControlTarget, string> = {
-  "filter-cutoff": "Filter Cutoff",
-  volume: "Volume",
-  "wave-blend": "Wave Blend",
-  "vibrato-depth": "Vibrato",
-  resonance: "Resonance",
-  reverb: "Reverb",
-  distortion: "Distortion",
-  pan: "Pan",
-  "delay-feedback": "Delay FB",
-  "pitch-bend": "Pitch Bend",
-};
-
-type Voice = {
-  oscA: OscillatorNode;
-  oscB: OscillatorNode;
-  gainA: GainNode;
-  gainB: GainNode;
-  voiceGain: GainNode;
-};
-
-function generateImpulse(ctx: AudioContext, duration: number, decay: number) {
-  const len = ctx.sampleRate * duration;
+function generateImpulse(ctx: AudioContext, dur: number, decay: number) {
+  const len = ctx.sampleRate * dur;
   const buf = ctx.createBuffer(2, len, ctx.sampleRate);
   for (let ch = 0; ch < 2; ch++) {
-    const data = buf.getChannelData(ch);
+    const d = buf.getChannelData(ch);
     for (let i = 0; i < len; i++) {
-      data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+      d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
     }
   }
   return buf;
 }
 
-function makeDistortionCurve(amount: number): Float32Array<ArrayBuffer> {
-  const samples = 44100;
-  const curve = new Float32Array(new ArrayBuffer(samples * 4));
-  const k = amount;
-  for (let i = 0; i < samples; i++) {
-    const x = (i * 2) / samples - 1;
-    curve[i] = ((3 + k) * x * 20 * (Math.PI / 180)) / (Math.PI + k * Math.abs(x));
-  }
-  return curve;
+function createNoiseBuffer(ctx: AudioContext): AudioBuffer {
+  const len = ctx.sampleRate * 2;
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  return buf;
 }
 
-const T = 0.04; // smoothing time constant for setTargetAtTime
+const T_FAST = 0.015;
+const T_MED  = 0.03;
+const T_SLOW = 0.05;
 
-export class AudioEngine {
+/**
+ * Monophonic violin-like engine.
+ *
+ * Signal chain:
+ *   oscSaw + oscTri → bodyGain → filter ─┐
+ *   noise → noiseBP → noiseGain ─────────┤→ dryGain ──→ master → dest
+ *                                         └→ convolver → wetGain → master
+ *   lfo → lfoGain → osc.detune
+ *
+ * bodyGain / noiseGain are driven by gate * bowEnergy.
+ * filter.frequency driven by bowEnergy + beta tilt + direction bias.
+ */
+export class ViolinEngine {
   private ctx: AudioContext | null = null;
-  private master: GainNode | null = null;
+
+  private oscSaw: OscillatorNode | null = null;
+  private oscTri: OscillatorNode | null = null;
+
+  private noiseSource: AudioBufferSourceNode | null = null;
+  private noiseBP: BiquadFilterNode | null = null;
+  private noiseGain: GainNode | null = null;
+
+  private bodyGain: GainNode | null = null;
   private filter: BiquadFilterNode | null = null;
-  private panner: StereoPannerNode | null = null;
-  private distNode: WaveShaperNode | null = null;
+
+  private dryGain: GainNode | null = null;
+  private convolver: ConvolverNode | null = null;
+  private wetGain: GainNode | null = null;
+
   private delayNode: DelayNode | null = null;
-  private delayFeedback: GainNode | null = null;
-  private delayDry: GainNode | null = null;
+  private delayFB: GainNode | null = null;
   private delayWet: GainNode | null = null;
-  private reverbNode: ConvolverNode | null = null;
-  private reverbDry: GainNode | null = null;
-  private reverbWet: GainNode | null = null;
+
+  private master: GainNode | null = null;
 
   private lfo: OscillatorNode | null = null;
   private lfoGain: GainNode | null = null;
 
-  private voices = new Map<number, Voice>();
-  private waveBlend = 0;
   private started = false;
-  private mappings: AxisMappings = { ...DEFAULT_MAPPINGS };
+  private gateOpen = false;
+  private bowEnergy = 0;
+  private bowDir = 1;
+  private brightness = 0.5;
+  private currentMidi = 64;
 
-  isStarted() {
-    return this.started;
-  }
-
-  getMappings() {
-    return { ...this.mappings };
-  }
-
-  setMappings(m: AxisMappings) {
-    this.mappings = { ...m };
-  }
+  isStarted() { return this.started; }
 
   async start() {
     if (this.started) return;
-
-    const Ctx =
-      window.AudioContext ||
-      ((window as unknown as Record<string, typeof AudioContext>)
-        .webkitAudioContext as typeof AudioContext);
+    const Ctx = window.AudioContext ||
+      (window as unknown as Record<string, typeof AudioContext>).webkitAudioContext;
     this.ctx = new Ctx();
-    const now = this.ctx.currentTime;
+    const t = this.ctx.currentTime;
 
-    // Master output
-    this.master = this.ctx.createGain();
-    this.master.gain.setValueAtTime(0.7, now);
+    // --- Oscillators (run continuously, gated by bodyGain) ---
+    this.oscSaw = this.ctx.createOscillator();
+    this.oscSaw.type = "sawtooth";
+    this.oscSaw.frequency.setValueAtTime(midiToHz(this.currentMidi), t);
 
-    // Panner
-    this.panner = this.ctx.createStereoPanner();
-    this.panner.pan.setValueAtTime(0, now);
+    this.oscTri = this.ctx.createOscillator();
+    this.oscTri.type = "triangle";
+    this.oscTri.frequency.setValueAtTime(midiToHz(this.currentMidi), t);
 
-    // Lowpass filter
+    // --- Noise ---
+    this.noiseSource = this.ctx.createBufferSource();
+    this.noiseSource.buffer = createNoiseBuffer(this.ctx);
+    this.noiseSource.loop = true;
+
+    this.noiseBP = this.ctx.createBiquadFilter();
+    this.noiseBP.type = "bandpass";
+    this.noiseBP.frequency.setValueAtTime(2000, t);
+    this.noiseBP.Q.setValueAtTime(0.8, t);
+
+    this.noiseGain = this.ctx.createGain();
+    this.noiseGain.gain.setValueAtTime(0, t);
+
+    // --- Body gain (gate * bowEnergy for oscillators) ---
+    this.bodyGain = this.ctx.createGain();
+    this.bodyGain.gain.setValueAtTime(0, t);
+
+    // --- Filter ---
     this.filter = this.ctx.createBiquadFilter();
     this.filter.type = "lowpass";
-    this.filter.frequency.setValueAtTime(900, now);
-    this.filter.Q.setValueAtTime(0.7, now);
+    this.filter.frequency.setValueAtTime(400, t);
+    this.filter.Q.setValueAtTime(1.2, t);
 
-    // Distortion (bypassed by default — curve = null means passthrough)
-    this.distNode = this.ctx.createWaveShaper();
-    this.distNode.oversample = "4x";
+    // --- Mix bus ---
+    const mixBus = this.ctx.createGain();
+    mixBus.gain.setValueAtTime(1, t);
 
-    // Delay with feedback loop
+    // --- Reverb ---
+    this.convolver = this.ctx.createConvolver();
+    this.convolver.buffer = generateImpulse(this.ctx, 1.8, 2.8);
+    this.dryGain = this.ctx.createGain();
+    this.dryGain.gain.setValueAtTime(1, t);
+    this.wetGain = this.ctx.createGain();
+    this.wetGain.gain.setValueAtTime(0.18, t);
+
+    // --- Delay ---
     this.delayNode = this.ctx.createDelay(1.0);
-    this.delayNode.delayTime.setValueAtTime(0.3, now);
-    this.delayFeedback = this.ctx.createGain();
-    this.delayFeedback.gain.setValueAtTime(0, now);
-    this.delayDry = this.ctx.createGain();
-    this.delayDry.gain.setValueAtTime(1, now);
+    this.delayNode.delayTime.setValueAtTime(0.22, t);
+    this.delayFB = this.ctx.createGain();
+    this.delayFB.gain.setValueAtTime(0.2, t);
     this.delayWet = this.ctx.createGain();
-    this.delayWet.gain.setValueAtTime(0.3, now);
+    this.delayWet.gain.setValueAtTime(0.12, t);
 
-    // Delay feedback loop
-    this.delayNode.connect(this.delayFeedback);
-    this.delayFeedback.connect(this.delayNode);
-    this.delayNode.connect(this.delayWet);
+    // --- Master ---
+    this.master = this.ctx.createGain();
+    this.master.gain.setValueAtTime(0.85, t);
 
-    // Reverb (convolver)
-    this.reverbNode = this.ctx.createConvolver();
-    this.reverbNode.buffer = generateImpulse(this.ctx, 2.0, 2.5);
-    this.reverbDry = this.ctx.createGain();
-    this.reverbDry.gain.setValueAtTime(1, now);
-    this.reverbWet = this.ctx.createGain();
-    this.reverbWet.gain.setValueAtTime(0, now);
-
-    // LFO for vibrato
+    // --- LFO (vibrato) ---
     this.lfo = this.ctx.createOscillator();
     this.lfo.type = "sine";
-    this.lfo.frequency.setValueAtTime(5.0, now);
+    this.lfo.frequency.setValueAtTime(5.5, t);
     this.lfoGain = this.ctx.createGain();
-    this.lfoGain.gain.setValueAtTime(0, now);
+    this.lfoGain.gain.setValueAtTime(0, t);
     this.lfo.connect(this.lfoGain);
+    this.lfoGain.connect(this.oscSaw.detune);
+    this.lfoGain.connect(this.oscTri.detune);
 
-    // Signal chain:
-    // voices → filter → distortion → [delay dry/wet] → [reverb dry/wet] → panner → master → dest
-    this.filter.connect(this.distNode);
+    // --- Wiring ---
+    // Oscillators → bodyGain → filter
+    this.oscSaw.connect(this.bodyGain);
+    this.oscTri.connect(this.bodyGain);
+    this.bodyGain.connect(this.filter);
 
-    // Distortion splits into delay dry + delay input
-    this.distNode.connect(this.delayDry);
-    this.distNode.connect(this.delayNode);
+    // Noise → bandpass → noiseGain → filter
+    this.noiseSource.connect(this.noiseBP);
+    this.noiseBP.connect(this.noiseGain);
+    this.noiseGain.connect(this.filter);
 
-    // Merge delay dry + wet into reverb split
-    const postDelay = this.ctx.createGain();
-    postDelay.gain.setValueAtTime(1, now);
-    this.delayDry.connect(postDelay);
-    this.delayWet.connect(postDelay);
+    // Filter → mixBus
+    this.filter.connect(mixBus);
 
-    // Reverb split
-    postDelay.connect(this.reverbDry);
-    postDelay.connect(this.reverbNode);
-    this.reverbNode.connect(this.reverbWet);
+    // MixBus → dry path
+    mixBus.connect(this.dryGain);
+    // MixBus → delay → delayWet (+ feedback loop)
+    mixBus.connect(this.delayNode);
+    this.delayNode.connect(this.delayFB);
+    this.delayFB.connect(this.delayNode);
+    this.delayNode.connect(this.delayWet);
 
-    // Merge reverb dry + wet into panner
-    this.reverbDry.connect(this.panner);
-    this.reverbWet.connect(this.panner);
+    // Dry + delayWet → reverb split
+    const preReverb = this.ctx.createGain();
+    preReverb.gain.setValueAtTime(1, t);
+    this.dryGain.connect(preReverb);
+    this.delayWet.connect(preReverb);
 
-    this.panner.connect(this.master);
+    preReverb.connect(this.master); // dry reverb path
+    preReverb.connect(this.convolver);
+    this.convolver.connect(this.wetGain);
+    this.wetGain.connect(this.master);
+
     this.master.connect(this.ctx.destination);
 
-    this.lfo.start();
+    // Start sources
+    this.oscSaw.start(t);
+    this.oscTri.start(t);
+    this.noiseSource.start(t);
+    this.lfo.start(t);
+
     await this.ctx.resume();
     this.started = true;
   }
 
-  private midiToHz(midi: number) {
-    return 440 * Math.pow(2, (midi - 69) / 12);
+  // --- Gate (finger on/off string) ---
+
+  setGate(on: boolean) {
+    this.gateOpen = on;
+    this.updateLevels();
   }
 
-  noteOn(midi: number, velocity = 0.9) {
-    if (!this.ctx || !this.filter) return;
-    if (this.voices.has(midi)) return;
+  // --- Pitch ---
 
+  setPitch(midi: number) {
+    if (!this.ctx) return;
+    this.currentMidi = midi;
+    const hz = midiToHz(midi);
     const t = this.ctx.currentTime;
-    const hz = this.midiToHz(midi);
-    const vol = Math.max(0.05, velocity) * 0.2;
+    this.oscSaw!.frequency.setTargetAtTime(hz, t, T_FAST);
+    this.oscTri!.frequency.setTargetAtTime(hz, t, T_FAST);
+    // Noise bandpass tracks pitch (centered around 3rd harmonic area)
+    this.noiseBP!.frequency.setTargetAtTime(
+      Math.min(hz * 3, 8000), t, T_MED
+    );
+  }
 
-    // Two oscillators for wave blending (sawtooth ↔ square)
-    const oscA = this.ctx.createOscillator();
-    oscA.type = "sawtooth";
-    oscA.frequency.setValueAtTime(hz, t);
+  // --- Bow (from acceleration-based velocity integration) ---
 
-    const oscB = this.ctx.createOscillator();
-    oscB.type = "square";
-    oscB.frequency.setValueAtTime(hz, t);
+  setBow(energy: number, direction: number) {
+    this.bowEnergy = energy;
+    this.bowDir = direction;
+    this.updateLevels();
+    this.updateFilter();
+  }
 
-    const gainA = this.ctx.createGain();
-    const gainB = this.ctx.createGain();
-    gainA.gain.setValueAtTime(1 - this.waveBlend, t);
-    gainB.gain.setValueAtTime(this.waveBlend, t);
+  triggerOnset() {
+    if (!this.ctx || !this.gateOpen) return;
+    const t = this.ctx.currentTime;
 
-    const voiceGain = this.ctx.createGain();
-    voiceGain.gain.setValueAtTime(0.0001, t);
-    voiceGain.gain.exponentialRampToValueAtTime(vol, t + 0.02);
-
-    oscA.connect(gainA);
-    oscB.connect(gainB);
-    gainA.connect(voiceGain);
-    gainB.connect(voiceGain);
-    voiceGain.connect(this.filter);
-
-    if (this.lfoGain) {
-      this.lfoGain.connect(oscA.detune);
-      this.lfoGain.connect(oscB.detune);
+    // Gain bump
+    if (this.bodyGain) {
+      const cur = Math.max(this.bodyGain.gain.value, 0.001);
+      this.bodyGain.gain.cancelScheduledValues(t);
+      this.bodyGain.gain.setValueAtTime(cur * 1.5, t);
+      this.bodyGain.gain.setTargetAtTime(cur, t + 0.01, T_MED);
     }
 
-    oscA.start(t);
-    oscB.start(t);
-    this.voices.set(midi, { oscA, oscB, gainA, gainB, voiceGain });
+    // Filter bump
+    if (this.filter) {
+      const curF = this.filter.frequency.value;
+      this.filter.frequency.cancelScheduledValues(t);
+      this.filter.frequency.setValueAtTime(curF + 900, t);
+      this.filter.frequency.setTargetAtTime(curF, t + 0.01, T_SLOW);
+    }
+
+    // Noise burst
+    if (this.noiseGain) {
+      const curN = Math.max(this.noiseGain.gain.value, 0.001);
+      this.noiseGain.gain.cancelScheduledValues(t);
+      this.noiseGain.gain.setValueAtTime(Math.min(curN * 3, 0.5), t);
+      this.noiseGain.gain.setTargetAtTime(curN, t + 0.01, T_MED);
+    }
   }
 
-  noteOff(midi: number) {
-    const v = this.voices.get(midi);
-    if (!v || !this.ctx) return;
+  // --- Tilt controls ---
 
-    const t = this.ctx.currentTime;
-    v.voiceGain.gain.cancelScheduledValues(t);
-    v.voiceGain.gain.setValueAtTime(Math.max(v.voiceGain.gain.value, 0.0001), t);
-    v.voiceGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.06);
-
-    v.oscA.stop(t + 0.08);
-    v.oscB.stop(t + 0.08);
-    this.voices.delete(midi);
+  setBrightness(v: number) {
+    this.brightness = Math.max(0, Math.min(1, v));
+    this.updateFilter();
   }
+
+  setVibratoDepth(v: number) {
+    if (!this.ctx || !this.lfoGain) return;
+    const cents = Math.abs(v) * 40; // 0..40 cents
+    this.lfoGain.gain.setTargetAtTime(cents, this.ctx.currentTime, T_SLOW);
+  }
+
+  // --- All off ---
 
   allOff() {
-    for (const midi of this.voices.keys()) this.noteOff(midi);
+    this.gateOpen = false;
+    this.bowEnergy = 0;
+    this.updateLevels();
   }
 
-  /**
-   * Apply a normalized -1..1 value to a control target.
-   * Each target interprets the range appropriately.
-   */
-  private applyControl(target: ControlTarget, value: number) {
-    if (!this.ctx) return;
-    const t = this.ctx.currentTime;
-    const v = Math.max(-1, Math.min(1, value));
+  // --- Internal ---
 
-    switch (target) {
-      case "filter-cutoff": {
-        if (!this.filter) return;
-        const norm = (v + 1) * 0.5; // 0..1
-        const cutoff = 200 * Math.pow(20, norm); // ~200..4000
-        this.filter.frequency.setTargetAtTime(cutoff, t, T);
-        break;
-      }
-      case "volume": {
-        if (!this.master) return;
-        const vol = 0.15 + ((v + 1) * 0.5) * 0.75; // 0.15..0.9
-        this.master.gain.setTargetAtTime(vol, t, T);
-        break;
-      }
-      case "wave-blend": {
-        const blend = (v + 1) * 0.5; // 0..1 (sawtooth → square)
-        this.waveBlend = blend;
-        for (const voice of this.voices.values()) {
-          voice.gainA.gain.setTargetAtTime(1 - blend, t, T);
-          voice.gainB.gain.setTargetAtTime(blend, t, T);
-        }
-        break;
-      }
-      case "vibrato-depth": {
-        if (!this.lfoGain) return;
-        const cents = Math.abs(v) * 40; // 0..40 cents
-        this.lfoGain.gain.setTargetAtTime(cents, t, T);
-        break;
-      }
-      case "resonance": {
-        if (!this.filter) return;
-        const q = 0.5 + Math.abs(v) * 14; // 0.5..14.5
-        this.filter.Q.setTargetAtTime(q, t, T);
-        break;
-      }
-      case "reverb": {
-        if (!this.reverbDry || !this.reverbWet) return;
-        const mix = Math.abs(v); // 0..1
-        this.reverbWet.gain.setTargetAtTime(mix * 0.8, t, T);
-        this.reverbDry.gain.setTargetAtTime(1 - mix * 0.3, t, T);
-        break;
-      }
-      case "distortion": {
-        if (!this.distNode) return;
-        const amount = Math.abs(v);
-        if (amount < 0.05) {
-          this.distNode.curve = null;
-        } else {
-          this.distNode.curve = makeDistortionCurve(amount * 50);
-        }
-        break;
-      }
-      case "pan": {
-        if (!this.panner) return;
-        this.panner.pan.setTargetAtTime(v, t, T);
-        break;
-      }
-      case "delay-feedback": {
-        if (!this.delayFeedback || !this.delayWet) return;
-        const fb = Math.abs(v) * 0.75; // 0..0.75 (safe, no runaway)
-        this.delayFeedback.gain.setTargetAtTime(fb, t, T);
-        this.delayWet.gain.setTargetAtTime(Math.min(fb + 0.1, 0.5), t, T);
-        break;
-      }
-      case "pitch-bend": {
-        const cents = v * 200; // ±200 cents (±2 semitones)
-        for (const voice of this.voices.values()) {
-          voice.oscA.detune.setTargetAtTime(cents, t, T);
-          voice.oscB.detune.setTargetAtTime(cents, t, T);
-        }
-        break;
-      }
+  private updateLevels() {
+    if (!this.ctx || !this.bodyGain || !this.noiseGain) return;
+    const t = this.ctx.currentTime;
+
+    if (this.gateOpen && this.bowEnergy > 0) {
+      const bodyLevel = this.bowEnergy * 0.35;
+      const noiseLevel = Math.pow(this.bowEnergy, 2) * 0.18;
+      this.bodyGain.gain.setTargetAtTime(bodyLevel, t, T_FAST);
+      this.noiseGain.gain.setTargetAtTime(noiseLevel, t, T_FAST);
+    } else {
+      this.bodyGain.gain.setTargetAtTime(0, t, T_MED);
+      this.noiseGain.gain.setTargetAtTime(0, t, T_MED);
     }
   }
 
-  /**
-   * Called from motion handler with normalized -1..1 values for each axis.
-   */
-  setMotion(alpha: number, beta: number, gamma: number) {
-    this.applyControl(this.mappings.beta, beta);
-    this.applyControl(this.mappings.gamma, gamma);
-    this.applyControl(this.mappings.alpha, alpha);
+  private updateFilter() {
+    if (!this.ctx || !this.filter) return;
+    const t = this.ctx.currentTime;
+
+    const BASE = 300;
+    const RANGE = 4500;
+    const dirBias = this.bowDir > 0 ? 1.12 : 0.9;
+    const cutoff =
+      (BASE + (this.bowEnergy * 0.55 + this.brightness * 0.45) * RANGE) * dirBias;
+
+    this.filter.frequency.setTargetAtTime(
+      Math.min(cutoff, 12000), t, T_MED
+    );
   }
 }

@@ -1,16 +1,13 @@
-export type MotionHandler = (tiltX: number, tiltY: number) => void;
+export type MotionValues = {
+  alpha: number; // twist / compass — normalized to -1..1
+  beta: number;  // forward-back tilt — normalized to -1..1
+  gamma: number; // left-right tilt — normalized to -1..1
+};
+
+export type MotionHandler = (values: MotionValues) => void;
 
 function clamp(v: number, min: number, max: number) {
   return Math.max(min, Math.min(max, v));
-}
-
-function normalize(beta: number | null, gamma: number | null) {
-  const b = beta ?? 0;
-  const g = gamma ?? 0;
-
-  const tiltY = clamp(b / 45, -1, 1);
-  const tiltX = clamp(g / 45, -1, 1);
-  return { tiltX, tiltY };
 }
 
 /**
@@ -43,9 +40,14 @@ export async function requestMotionPermission(): Promise<
 }
 
 export function listenMotion(onMotion: MotionHandler): () => void {
-  let smoothX = 0;
-  let smoothY = 0;
-  const alpha = 0.25;
+  let smoothAlpha = 0;
+  let smoothBeta = 0;
+  let smoothGamma = 0;
+  const k = 0.25; // smoothing factor
+
+  // Alpha (compass heading 0..360) needs special handling:
+  // we track it as a delta from a baseline to get -1..1
+  let alphaBaseline: number | null = null;
 
   let last = 0;
   const handler = (e: DeviceOrientationEvent) => {
@@ -53,12 +55,31 @@ export function listenMotion(onMotion: MotionHandler): () => void {
     if (now - last < 16) return;
     last = now;
 
-    const { tiltX, tiltY } = normalize(e.beta, e.gamma);
+    // Beta: -180..180, most useful range ≈ -45..45
+    const rawBeta = clamp((e.beta ?? 0) / 45, -1, 1);
+    // Gamma: -90..90, most useful range ≈ -45..45
+    const rawGamma = clamp((e.gamma ?? 0) / 45, -1, 1);
 
-    smoothX += alpha * (tiltX - smoothX);
-    smoothY += alpha * (tiltY - smoothY);
+    // Alpha: 0..360 compass heading → normalize as offset from initial position
+    let rawAlpha = 0;
+    if (e.alpha !== null) {
+      if (alphaBaseline === null) alphaBaseline = e.alpha;
+      let delta = e.alpha - alphaBaseline;
+      // Wrap to -180..180
+      if (delta > 180) delta -= 360;
+      if (delta < -180) delta += 360;
+      rawAlpha = clamp(delta / 45, -1, 1);
+    }
 
-    onMotion(smoothX, smoothY);
+    smoothAlpha += k * (rawAlpha - smoothAlpha);
+    smoothBeta += k * (rawBeta - smoothBeta);
+    smoothGamma += k * (rawGamma - smoothGamma);
+
+    onMotion({
+      alpha: smoothAlpha,
+      beta: smoothBeta,
+      gamma: smoothGamma,
+    });
   };
 
   window.addEventListener("deviceorientation", handler, true);

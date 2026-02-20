@@ -1,8 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AudioEngine } from "../lib/audio/engine";
-import { requestMotionPermission, listenMotion } from "../lib/motion/sensors";
+import {
+  AudioEngine,
+  AxisMappings,
+  DEFAULT_MAPPINGS,
+  BETA_TARGETS,
+  GAMMA_TARGETS,
+  ALPHA_TARGETS,
+  TARGET_LABELS,
+  ControlTarget,
+} from "../lib/audio/engine";
+import {
+  requestMotionPermission,
+  listenMotion,
+  MotionValues,
+} from "../lib/motion/sensors";
 
 const NOTE_NAMES = ["C", "D", "E", "F", "G", "A", "B", "C"];
 const MIDI_NOTES = [60, 62, 64, 65, 67, 69, 71, 72];
@@ -17,6 +30,11 @@ const PAD_COLORS = [
   "#da77f2",
 ];
 
+function nextTarget(current: ControlTarget, list: ControlTarget[]) {
+  const idx = list.indexOf(current);
+  return list[(idx + 1) % list.length];
+}
+
 export default function Home() {
   const engineRef = useRef<AudioEngine | null>(null);
   const cleanupMotionRef = useRef<(() => void) | null>(null);
@@ -24,8 +42,9 @@ export default function Home() {
   const [started, setStarted] = useState(false);
   const [motionStatus, setMotionStatus] = useState("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [tilt, setTilt] = useState({ x: 0, y: 0 });
+  const [motion, setMotion] = useState<MotionValues>({ alpha: 0, beta: 0, gamma: 0 });
   const [activePads, setActivePads] = useState<Set<number>>(new Set());
+  const [mappings, setMappings] = useState<AxisMappings>({ ...DEFAULT_MAPPINGS });
 
   useEffect(() => {
     engineRef.current = new AudioEngine();
@@ -42,15 +61,11 @@ export default function Home() {
   const handleStart = useCallback(async () => {
     const engine = engineRef.current;
     if (!engine || engine.isStarted()) return;
-
     setErrorMsg(null);
 
-    // Step 1: Request motion permission FIRST — must happen synchronously
-    // in the user-gesture call stack before any other awaits.
     setMotionStatus("requesting permission...");
     const permResult = await requestMotionPermission();
 
-    // Step 2: Start audio (this can be async, gesture context already used above)
     try {
       await engine.start();
       setStarted(true);
@@ -60,13 +75,12 @@ export default function Home() {
       return;
     }
 
-    // Step 3: Attach motion listener based on permission result
     switch (permResult) {
       case "granted":
       case "not-needed": {
-        const cleanup = listenMotion((tiltX, tiltY) => {
-          engine.setMotion(tiltX, tiltY);
-          setTilt({ x: tiltX, y: tiltY });
+        const cleanup = listenMotion((values) => {
+          engine.setMotion(values.alpha, values.beta, values.gamma);
+          setMotion(values);
         });
         cleanupMotionRef.current = cleanup;
         setMotionStatus("active");
@@ -84,6 +98,17 @@ export default function Home() {
         break;
     }
   }, []);
+
+  const updateMapping = useCallback(
+    (axis: keyof AxisMappings, list: ControlTarget[]) => {
+      setMappings((prev) => {
+        const next = { ...prev, [axis]: nextTarget(prev[axis], list) };
+        engineRef.current?.setMappings(next);
+        return next;
+      });
+    },
+    []
+  );
 
   const padDown = useCallback((midi: number) => {
     engineRef.current?.noteOn(midi);
@@ -160,42 +185,82 @@ export default function Home() {
             ))}
           </div>
 
-          <div className="debug">
-            <div className="tilt-display">
-              <div className="tilt-bar-group">
-                <label>Tilt X (vibrato)</label>
-                <div className="tilt-bar-track">
-                  <div
-                    className="tilt-bar-fill x"
-                    style={{
-                      width: `${(Math.abs(tilt.x) * 50).toFixed(1)}%`,
-                      left: tilt.x < 0 ? undefined : "50%",
-                      right: tilt.x < 0 ? "50%" : undefined,
-                    }}
-                  />
-                  <div className="tilt-bar-center" />
-                </div>
-                <span className="tilt-val">{tilt.x.toFixed(2)}</span>
-              </div>
-              <div className="tilt-bar-group">
-                <label>Tilt Y (filter)</label>
-                <div className="tilt-bar-track">
-                  <div
-                    className="tilt-bar-fill y"
-                    style={{
-                      width: `${(Math.abs(tilt.y) * 50).toFixed(1)}%`,
-                      left: tilt.y < 0 ? undefined : "50%",
-                      right: tilt.y < 0 ? "50%" : undefined,
-                    }}
-                  />
-                  <div className="tilt-bar-center" />
-                </div>
-                <span className="tilt-val">{tilt.y.toFixed(2)}</span>
-              </div>
-            </div>
+          <div className="controls-panel">
+            <AxisRow
+              label="↕ Fwd/Back"
+              axis="beta"
+              value={motion.beta}
+              target={mappings.beta}
+              targets={BETA_TARGETS}
+              color="#f472b6"
+              onCycle={() => updateMapping("beta", BETA_TARGETS)}
+            />
+            <AxisRow
+              label="↔ Left/Right"
+              axis="gamma"
+              value={motion.gamma}
+              target={mappings.gamma}
+              targets={GAMMA_TARGETS}
+              color="#a78bfa"
+              onCycle={() => updateMapping("gamma", GAMMA_TARGETS)}
+            />
+            <AxisRow
+              label="↻ Twist"
+              axis="alpha"
+              value={motion.alpha}
+              target={mappings.alpha}
+              targets={ALPHA_TARGETS}
+              color="#38bdf8"
+              onCycle={() => updateMapping("alpha", ALPHA_TARGETS)}
+            />
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function AxisRow({
+  label,
+  value,
+  target,
+  color,
+  onCycle,
+}: {
+  label: string;
+  axis: string;
+  value: number;
+  target: ControlTarget;
+  targets: ControlTarget[];
+  color: string;
+  onCycle: () => void;
+}) {
+  const pct = Math.abs(value) * 50;
+  const isNeg = value < 0;
+
+  return (
+    <div className="axis-row">
+      <span className="axis-label">{label}</span>
+      <div className="axis-bar-track">
+        <div
+          className="axis-bar-fill"
+          style={{
+            width: `${pct.toFixed(1)}%`,
+            left: isNeg ? undefined : "50%",
+            right: isNeg ? "50%" : undefined,
+            background: color,
+          }}
+        />
+        <div className="axis-bar-center" />
+      </div>
+      <span className="axis-val">{value.toFixed(2)}</span>
+      <button
+        className="axis-target-btn"
+        style={{ borderColor: color, color }}
+        onClick={onCycle}
+      >
+        {TARGET_LABELS[target]}
+      </button>
     </div>
   );
 }

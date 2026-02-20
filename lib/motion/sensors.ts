@@ -13,18 +13,36 @@ function normalize(beta: number | null, gamma: number | null) {
   return { tiltX, tiltY };
 }
 
-export async function startMotion(onMotion: MotionHandler) {
-  const anyOrientation = DeviceOrientationEvent as unknown as {
+/**
+ * Must be called synchronously inside a user-gesture handler (tap/click)
+ * BEFORE any awaits, otherwise iOS will silently block the permission dialog.
+ */
+export async function requestMotionPermission(): Promise<
+  "granted" | "denied" | "not-needed" | "no-sensor"
+> {
+  if (typeof window === "undefined") return "no-sensor";
+
+  const DOE = DeviceOrientationEvent as unknown as {
     requestPermission?: () => Promise<string>;
   };
 
-  if (typeof anyOrientation?.requestPermission === "function") {
-    const res = await anyOrientation.requestPermission();
-    if (res !== "granted") {
-      throw new Error("Motion permission not granted");
+  if (typeof DOE.requestPermission === "function") {
+    try {
+      const result = await DOE.requestPermission();
+      return result === "granted" ? "granted" : "denied";
+    } catch {
+      return "denied";
     }
   }
 
+  if ("DeviceOrientationEvent" in window) {
+    return "not-needed";
+  }
+
+  return "no-sensor";
+}
+
+export function listenMotion(onMotion: MotionHandler): () => void {
   let smoothX = 0;
   let smoothY = 0;
   const alpha = 0.25;
